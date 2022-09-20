@@ -208,6 +208,7 @@ class DataGenerator(keras.utils.Sequence):
 
             return [x1, x2], x3
 
+
 # STEP 6: GENERATE THE TRAINING DATA SET
 
 train_df = df.sample(frac=0.75, random_state=42)  #random state used for initializing the internal random number generator.
@@ -273,3 +274,162 @@ class RelationalGraphConvLayer(keras.layers.Layer):
             x_reduced = tf.reduce_sum(x, axis=1)
             # Apply non-linear transformation.
             return self.activation(x_reduced)
+
+
+# STEP 7: BUILD THE ENCODER AND DECODER
+
+# The encoder takes the molecule's adjacency matrix and feature matrix as an input.
+# Features are processed via a Graph Convolution layer.
+# Several Dense layers work to flatten these features, to create the latent space representation.
+
+# Building the Encoder
+def get_encoder(gconv_units, latent_dim, adjancency_shape, feature_shape, dense_units, dropout_rate):
+    """
+    Reference for this block of code: https://keras.io/examples/generative/wgan-graphs/
+    :param gconv_units:
+    :param latent_dim:
+    :param adjancency_shape:
+    :param feature_shape:
+    :param dense_units:
+    :param dropout_rate:
+    :return:
+    """
+    adjacency = keras.layers.Input(shape=adjancency_shape)
+    features = keras.layers.Input(shape=feature_shape)
+
+    # Graph Convolutional Layer: Propagate through one or more graph convolutional layers
+    features_transformed = features
+    for units in gconv_units:
+        features_transformed = RelationalGraphConvLayer(units)(
+            [adjacency, features_transformed]
+        )
+    # Reduce the 2-D representation of the molecule to 1-D representation
+    x = keras.layers.GlobalAveragePooling1D()(features_transformed)
+
+    # Dense Layers: Propagate through one or more densely connected layers
+    for units in dense_units:
+        x = layers.Dense(units, activation="relu")(x)
+        x = layers.Dropout(dropout_rate)(x)
+
+    # Latent space representation
+    z_mean = layers.Dense(latent_dim, dtype="float32", name="z_mean")(x)
+    log_var = layers.Dense(latent_dim, dtype="float32", name="log_var")(x)
+
+    encoder = keras.Model([adjacency, features], [z_mean, log_var], name="encoder")
+
+    return encoder
+
+# Building the Decoder
+def get_decoder(dense_units, dropout_rate, latent_dim, adjacency_shape, feature_shape):
+    """
+    Reference for this block of code: Reference: https://keras.io/examples/generative/wgan-graphs/
+    :param dense_units:
+    :param dropout_rate:
+    :param latent_dim:
+    :param adjacency_shape:
+    :param feature_shape:
+    :return:
+    """
+    latent_inputs = keras.Input(shape=(latent_dim,))
+
+    x = latent_inputs
+    for units in dense_units:
+        x = keras.layers.Dense(units, activation="tanh")(x)
+        x = keras.layers.Dropout(dropout_rate)(x)
+
+    # Map the outputs of the previous later (x) to [continuous] adjacency tensors (x_adjacency)
+    x_adjacency = keras.layers.Dense(tf.math.reduce_prod(adjacency_shape))(x)
+    x_adjacency = keras.layers.Reshape(adjacency_shape)(x_adjacency)
+
+    # Make tensors in the last two dimensions symmetrical
+    x_adjacency = (x_adjacency +tf.transpose(x_adjacency, (0, 1, 3, 2)))/2
+    x_adjacency = keras.layers.Softmax(axis=1)(x_adjacency)
+
+    # Map outputs of previous layer (x) to [continuous] feature tensors (x_features)
+    x_features = keras.layers.Dense(tf.math.reduce_prod(feature_shape))(x)
+    x_features = keras.layers.Reshape(feature_shape)(x_features)
+    x_features = keras.layers.Softmax(axis=2)(x_features)
+
+    decoder = keras.Model(latent_inputs, outputs=[x_adjacency, x_features], name="decoder")
+
+    return decoder
+
+# STEP 8: BUILD THE SAMPLING LAYER
+
+class Sampling(layers.Layer):
+    """
+    Uses (z_mean, z_log_var) to sample z, the vector encoding.
+    """
+    def call(self, inputs):
+        z_mean, z_log_var = inputs
+        batch = tf.shape(z_log_var)[0]
+        dim = tf.shape(z_log_var)[1]
+        epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+
+        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+# STEP 9: BUILD THE VAE
+
+# This model is trained to optimize four losses: (i) categorical crossentropy; (ii) KL divergence loss; (iii) property prediction loss; (iv) Graph loss
+class MoleculeGenerator (keras.Model):
+    def __init__(self, encoder, decoder, max_len, **kwargs):
+        super().__init__(**kwargs)
+        self.encoder = encoder
+        self.decoder = decoder
+        self.property_predicition_layer = layers.Dense(1)
+        self.max_len = max_len
+
+        self.train_total_loss_tracker = keras.metrics.Mean(name="train_total_loss")
+        self.val_total_loss_tracker = keras.metrics.Mean(name="val_total_loss")
+
+    def train_step(self, data):
+        mol_features, mol_property = data
+        graph_real = mol_features
+        self.batch_size = tf.shape(mol_property)[0]
+        with tf.GradientTape() as tape:
+            z_mean, z_log_var, property_prediction, \
+            reconstruction_adjacency, reconstruction_adjacency, reconstruction_features = self(mol_features, training = True)
+            graph_generated = [reconstruction_adjacency, reconstruction_features]
+            total_loss = self.calculate_loss(z_log_var, z_mean, mol_property, property_prediction, graph_real, graph_generated, is_train= True)
+            grads = tape.gradient(total_loss, self.trainable_weights)
+            self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+
+            self.train_total_loss_tracker.update_state(total_loss)
+            return {
+                "loss": self.train_total_loss_tracker.result(),
+            }
+
+    def test_step(self, data):
+        mol_features, mol_property = data
+        z_mean, z_log_var, property_prediction, \
+        reconstruction_adjacency, reconstruction_features = self(mol_features, training=False)
+        total_loss = self.calculate_loss(z_log_var, z_mean, mol_property, property_prediction, graph_real = mol_features, graph_generated=[reconstruction_adjacency, reconstruction_features],
+                                         is_train = False)
+
+        self.val_total_loss_tracker.update_state(total_loss)
+        return {
+            "loss": self.val_total_loss_tracker.result()
+        }
+
+    def calculate_loss(self, z_log_var, z_mean, mol_property, property_prediction, graph_real, graph_generated, is_train):
+        adjacency_real, features_real = graph_real
+        adjacency_generated, features_generated = graph_generated
+
+        adjacency_reconstruction_loss = tf.reduce_mean(
+            tf.reduce_sum(
+                keras.losses.categorical_crossentropy(features_real, features_generated),
+                axis=(1,2)
+            )
+        )
+        features_reconstruction_loss = tf.reduce_mean(
+            tf.reduce_sum(
+                keras.losses.categorical_crossentropy(features_generated, features_generated),
+                axis=(1)
+            )
+        )
+        kl_loss = -0.5 * tf.reduce_sum(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), 1)
+        kl_loss = tf.reduce_mean(kl_loss)
+
+        property_prediction_loss = tf.reduce_mean(
+            keras.losses.binary_crossentropy(mol_property, property_prediction)
+        )
