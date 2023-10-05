@@ -1,3 +1,7 @@
+# STEP 0 : INSTALL LIBRARIES
+
+# install pypi
+!pip -q install rdkit-pypi==2021.9.4
 
 # STEP 1: IMPORT LIBRARIES
 
